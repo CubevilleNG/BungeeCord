@@ -446,7 +446,6 @@ public final class UserConnection implements ProxiedPlayer
 
             if ( server != null )
             {
-                server.setObsolete( true );
                 server.disconnect( "Quitting" );
             }
         }
