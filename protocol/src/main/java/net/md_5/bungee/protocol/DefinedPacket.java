@@ -15,12 +15,12 @@ import java.util.Arrays;
 import java.util.BitSet;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.function.BiConsumer;
 import lombok.RequiredArgsConstructor;
 import net.md_5.bungee.api.chat.BaseComponent;
 import net.md_5.bungee.api.chat.ComponentStyle;
-import net.md_5.bungee.chat.ComponentSerializer;
 import se.llbit.nbt.ErrorTag;
 import se.llbit.nbt.NamedTag;
 import se.llbit.nbt.SpecificTag;
@@ -69,6 +69,15 @@ public abstract class DefinedPacket
         buf.writeBytes( b );
     }
 
+    public static <T> T readStringMapKey(ByteBuf buf, Map<String, T> map)
+    {
+        String string = readString( buf );
+        T result = map.get( string );
+        Preconditions.checkArgument( result != null, "Unknown string key %s", string );
+
+        return result;
+    }
+
     public static String readString(ByteBuf buf)
     {
         return readString( buf, Short.MAX_VALUE );
@@ -110,12 +119,12 @@ public abstract class DefinedPacket
             SpecificTag nbt = (SpecificTag) readTag( buf, protocolVersion );
             JsonElement json = TagUtil.toJson( nbt );
 
-            return ComponentSerializer.deserialize( json );
+            return ChatSerializer.forVersion( protocolVersion ).deserialize( json );
         } else
         {
             String string = readString( buf, maxStringLength );
 
-            return ComponentSerializer.deserialize( string );
+            return ChatSerializer.forVersion( protocolVersion ).deserialize( string );
         }
     }
 
@@ -124,7 +133,7 @@ public abstract class DefinedPacket
         SpecificTag nbt = (SpecificTag) readTag( buf, protocolVersion );
         JsonElement json = TagUtil.toJson( nbt );
 
-        return ComponentSerializer.deserializeStyle( json );
+        return ChatSerializer.forVersion( protocolVersion ).deserializeStyle( json );
     }
 
     public static void writeEitherBaseComponent(Either<String, BaseComponent> message, ByteBuf buf, int protocolVersion)
@@ -142,13 +151,13 @@ public abstract class DefinedPacket
     {
         if ( protocolVersion >= ProtocolConstants.MINECRAFT_1_20_3 )
         {
-            JsonElement json = ComponentSerializer.toJson( message );
+            JsonElement json = ChatSerializer.forVersion( protocolVersion ).toJson( message );
             SpecificTag nbt = TagUtil.fromJson( json );
 
             writeTag( nbt, buf, protocolVersion );
         } else
         {
-            String string = ComponentSerializer.toString( message );
+            String string = ChatSerializer.forVersion( protocolVersion ).toString( message );
 
             writeString( string, buf );
         }
@@ -156,7 +165,7 @@ public abstract class DefinedPacket
 
     public static void writeComponentStyle(ComponentStyle style, ByteBuf buf, int protocolVersion)
     {
-        JsonElement json = ComponentSerializer.toJson( style );
+        JsonElement json = ChatSerializer.forVersion( protocolVersion ).toJson( style );
         SpecificTag nbt = TagUtil.fromJson( json );
 
         writeTag( nbt, buf, protocolVersion );
@@ -279,6 +288,31 @@ public abstract class DefinedPacket
             {
                 break;
             }
+        }
+    }
+
+    public static void setVarInt(int value, ByteBuf output, int pos, int len)
+    {
+        switch ( len )
+        {
+            case 1:
+                output.setByte( pos, value );
+                break;
+            case 2:
+                output.setShort( pos, ( value & 0x7F | 0x80 ) << 8 | ( value >>> 7 & 0x7F ) );
+                break;
+            case 3:
+                output.setMedium( pos, ( value & 0x7F | 0x80 ) << 16 | ( value >>> 7 & 0x7F | 0x80 ) << 8 | ( value >>> 14 & 0x7F ) );
+                break;
+            case 4:
+                output.setInt( pos, ( value & 0x7F | 0x80 ) << 24 | ( value >>> 7 & 0x7F | 0x80 ) << 16 | ( value >>> 14 & 0x7F | 0x80 ) << 8 | ( value >>> 21 & 0x7F ) );
+                break;
+            case 5:
+                output.setInt( pos, ( value & 0x7F | 0x80 ) << 24 | ( value >>> 7 & 0x7F | 0x80 ) << 16 | ( value >>> 14 & 0x7F | 0x80 ) << 8 | ( value >>> 21 & 0x7F | 0x80 ) );
+                output.setByte( pos + 4, value >>> 28 );
+                break;
+            default:
+                throw new IllegalArgumentException( "Invalid varint len: " + len );
         }
     }
 
@@ -499,7 +533,7 @@ public abstract class DefinedPacket
 
     public static BitSet readFixedBitSet(int i, ByteBuf buf)
     {
-        byte[] bits = new byte[ ( i + 8 ) >> 3 ];
+        byte[] bits = new byte[ ( i + 7 ) >> 3 ];
         buf.readBytes( bits );
 
         return BitSet.valueOf( bits );
@@ -511,7 +545,7 @@ public abstract class DefinedPacket
         {
             throw new OverflowPacketException( "BitSet too large (expected " + size + " got " + bits.size() + ")" );
         }
-        buf.writeBytes( Arrays.copyOf( bits.toByteArray(), ( size + 8 ) >> 3 ) );
+        buf.writeBytes( Arrays.copyOf( bits.toByteArray(), ( size + 7 ) >> 3 ) );
     }
 
     public void read(ByteBuf buf)

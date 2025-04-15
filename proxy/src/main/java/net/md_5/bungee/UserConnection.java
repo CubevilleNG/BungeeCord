@@ -3,14 +3,13 @@ package net.md_5.bungee;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableMap;
 import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
-import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.util.internal.PlatformDependent;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -21,7 +20,6 @@ import java.util.Objects;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.logging.Level;
 import lombok.Getter;
 import lombok.NonNull;
@@ -40,7 +38,7 @@ import net.md_5.bungee.api.connection.ProxiedPlayer;
 import net.md_5.bungee.api.event.PermissionCheckEvent;
 import net.md_5.bungee.api.event.ServerConnectEvent;
 import net.md_5.bungee.api.score.Scoreboard;
-import net.md_5.bungee.chat.ComponentSerializer;
+import net.md_5.bungee.chat.VersionedComponentSerializer;
 import net.md_5.bungee.connection.InitialHandler;
 import net.md_5.bungee.entitymap.EntityMap;
 import net.md_5.bungee.forge.ForgeClientHandler;
@@ -49,9 +47,8 @@ import net.md_5.bungee.forge.ForgeServerHandler;
 import net.md_5.bungee.netty.ChannelWrapper;
 import net.md_5.bungee.netty.HandlerBoss;
 import net.md_5.bungee.netty.PipelineUtils;
+import net.md_5.bungee.protocol.ChatSerializer;
 import net.md_5.bungee.protocol.DefinedPacket;
-import net.md_5.bungee.protocol.MinecraftDecoder;
-import net.md_5.bungee.protocol.MinecraftEncoder;
 import net.md_5.bungee.protocol.PacketWrapper;
 import net.md_5.bungee.protocol.Protocol;
 import net.md_5.bungee.protocol.ProtocolConstants;
@@ -137,6 +134,8 @@ public final class UserConnection implements ProxiedPlayer
     private String displayName;
     @Getter
     private EntityMap entityRewrite;
+    @Getter
+    private VersionedComponentSerializer chatSerializer;
     private Locale locale;
     /*========================================================================*/
     @Getter
@@ -146,13 +145,25 @@ public final class UserConnection implements ProxiedPlayer
     @Setter
     private ForgeServerHandler forgeServerHandler;
     /*========================================================================*/
-    private final Queue<DefinedPacket> packetQueue = new ConcurrentLinkedQueue<>();
+    private final Queue<DefinedPacket> packetQueue = new ArrayDeque<>();
     private final Unsafe unsafe = new Unsafe()
     {
         @Override
         public void sendPacket(DefinedPacket packet)
         {
             ch.write( packet );
+        }
+
+        @Override
+        public void sendPacketQueued(DefinedPacket packet)
+        {
+            if ( pendingConnection.getVersion() >= ProtocolConstants.MINECRAFT_1_20_2 )
+            {
+                UserConnection.this.sendPacketQueued( packet );
+            } else
+            {
+                sendPacket( packet );
+            }
         }
     };
 
@@ -166,6 +177,7 @@ public final class UserConnection implements ProxiedPlayer
     public boolean init()
     {
         this.entityRewrite = EntityMap.getEntityMap( getPendingConnection().getVersion() );
+        this.chatSerializer = ChatSerializer.forVersion( getPendingConnection().getVersion() );
 
         this.displayName = name;
 
@@ -193,23 +205,39 @@ public final class UserConnection implements ProxiedPlayer
 
     public void sendPacketQueued(DefinedPacket packet)
     {
-        Protocol encodeProtocol = ch.getEncodeProtocol();
-        if ( !encodeProtocol.TO_CLIENT.hasPacket( packet.getClass(), getPendingConnection().getVersion() ) )
+        ch.scheduleIfNecessary( () ->
         {
-            packetQueue.add( packet );
-        } else
-        {
-            unsafe().sendPacket( packet );
-        }
+            if ( ch.isClosed() )
+            {
+                return;
+            }
+            Protocol encodeProtocol = ch.getEncodeProtocol();
+            if ( !encodeProtocol.TO_CLIENT.hasPacket( packet.getClass(), getPendingConnection().getVersion() ) )
+            {
+                // we should limit this so bad api usage won't oom the server.
+                Preconditions.checkState( packetQueue.size() <= 4096, "too many queued packets" );
+                packetQueue.add( packet );
+            } else
+            {
+                unsafe().sendPacket( packet );
+            }
+        } );
     }
 
     public void sendQueuedPackets()
     {
-        DefinedPacket packet;
-        while ( ( packet = packetQueue.poll() ) != null )
+        ch.scheduleIfNecessary( () ->
         {
-            unsafe().sendPacket( packet );
-        }
+            if ( ch.isClosed() )
+            {
+                return;
+            }
+            DefinedPacket packet;
+            while ( ( packet = packetQueue.poll() ) != null )
+            {
+                unsafe().sendPacket( packet );
+            }
+        } );
     }
 
     @Deprecated
@@ -313,7 +341,7 @@ public final class UserConnection implements ProxiedPlayer
     {
         Preconditions.checkNotNull( request, "request" );
 
-        ch.getHandle().eventLoop().execute( () -> connect0( request ) );
+        ch.scheduleIfNecessary( () -> connect0( request ) );
     }
 
     private void connect0(final ServerConnectRequest request)
@@ -355,17 +383,6 @@ public final class UserConnection implements ProxiedPlayer
 
         pendingConnects.add( target );
 
-        ChannelInitializer initializer = new ChannelInitializer()
-        {
-            @Override
-            protected void initChannel(Channel ch) throws Exception
-            {
-                PipelineUtils.BASE_SERVERSIDE.initChannel( ch );
-                ch.pipeline().addAfter( PipelineUtils.FRAME_DECODER, PipelineUtils.PACKET_DECODER, new MinecraftDecoder( Protocol.HANDSHAKE, false, getPendingConnection().getVersion() ) );
-                ch.pipeline().addAfter( PipelineUtils.FRAME_PREPENDER, PipelineUtils.PACKET_ENCODER, new MinecraftEncoder( Protocol.HANDSHAKE, false, getPendingConnection().getVersion() ) );
-                ch.pipeline().get( HandlerBoss.class ).setHandler( new ServerConnector( bungee, UserConnection.this, target ) );
-            }
-        };
         ChannelFutureListener listener = new ChannelFutureListener()
         {
             @Override
@@ -394,13 +411,16 @@ public final class UserConnection implements ProxiedPlayer
                     {
                         sendMessage( bungee.getTranslation( "fallback_kick", connectionFailMessage( future.cause() ) ) );
                     }
+                } else
+                {
+                    future.channel().pipeline().get( HandlerBoss.class ).setHandler( new ServerConnector( bungee, UserConnection.this, target ) );
                 }
             }
         };
         Bootstrap b = new Bootstrap()
                 .channel( PipelineUtils.getChannel( target.getAddress() ) )
                 .group( ch.getHandle().eventLoop() )
-                .handler( initializer )
+                .handler( bungee.unsafe().getBackendChannelInitializer().getChannelInitializer() )
                 .option( ChannelOption.CONNECT_TIMEOUT_MILLIS, request.getConnectTimeout() )
                 .remoteAddress( target.getAddress() );
         // Windows is bugged, multi homed users will just have to live with random connecting IPs
@@ -547,7 +567,7 @@ public final class UserConnection implements ProxiedPlayer
             sendPacketQueued( new SystemChat( message, position.ordinal() ) );
         } else
         {
-            sendPacketQueued( new Chat( ComponentSerializer.toString( message ), (byte) position.ordinal(), sender ) );
+            sendPacketQueued( new Chat( chatSerializer.toString( message ), (byte) position.ordinal(), sender ) );
         }
     }
 
