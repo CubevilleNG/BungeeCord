@@ -197,6 +197,10 @@ public final class TextComponent extends BaseComponent
                     URI uri = new URI( urlString );
                 } catch ( URISyntaxException e )
                 {
+                    component.setText( urlString );
+                    appender.accept( component );
+                    i += pos - i - 1;
+                    component = old;
                     continue;
                 }
                 component.setText( urlString );
