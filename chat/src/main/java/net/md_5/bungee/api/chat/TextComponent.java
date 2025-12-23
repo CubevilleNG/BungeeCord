@@ -1,5 +1,7 @@
 package net.md_5.bungee.api.chat;
 
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.function.Consumer;
@@ -190,6 +192,13 @@ public final class TextComponent extends BaseComponent
                 TextComponent old = component;
                 component = new TextComponent( old );
                 String urlString = message.substring( i, pos );
+                try
+                {
+                    URI uri = new URI( urlString );
+                } catch ( URISyntaxException e )
+                {
+                    continue;
+                }
                 component.setText( urlString );
                 component.setClickEvent( new ClickEvent( ClickEvent.Action.OPEN_URL,
                         urlString.startsWith( "http" ) ? urlString : "http://" + urlString ) );
